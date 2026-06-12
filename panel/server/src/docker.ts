@@ -1,5 +1,6 @@
 import { hostname } from 'node:os';
 import { existsSync, readdirSync } from 'node:fs';
+import http from 'node:http';
 import Docker from 'dockerode';
 import type { Instance } from './store.js';
 
@@ -36,6 +37,20 @@ function realisticHostname(id: string): string {
   const w = words[h % words.length];
   const n = ((h >>> 8) % 900) + 100; // 100-999，避免前导 0
   return `${w}-pc-${n}`;
+}
+
+// 给实例容器派生一个"像真实有线网卡"的 MAC：常见网卡厂商 OUI 前缀 + 由 id 稳定派生的后三段。
+// 容器默认 MAC 带"本地管理位"（第一字节第 2 位为 1，如 02/26/ee 开头），是"非真实硬件"的明显特征；
+// 这里用全局管理、单播的真实厂商 OUI，更像一台插了网卡的真机。同一实例每次重建得到相同 MAC。
+function realisticMac(id: string): string {
+  // 常见消费级网卡厂商 OUI（全局管理 + 单播，首字节低两位为 0）
+  const ouis = ['001b21', '8c1645', '00e04c', '0021cc', '3c970e', '001422', 'b827eb'];
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 131 + id.charCodeAt(i)) >>> 0;
+  const oui = ouis[h % ouis.length];
+  const hex = (n: number) => (n & 0xff).toString(16).padStart(2, '0');
+  const tail = hex(h >>> 3) + hex(h >>> 11) + hex(h >>> 19);
+  return (oui + tail).match(/.{2}/g)!.join(':');
 }
 
 const docker = new Docker(); // 默认连 /var/run/docker.sock
@@ -141,7 +156,9 @@ export async function runInstance(inst: Instance): Promise<void> {
     hostConfig.GroupAdd = ['video']; // 让容器内 abc 用户能访问 /dev/videoN
     console.log(`[docker] 实例 ${inst.id} 挂载摄像头设备: ${vids.join(', ')}`);
   }
-  const container = await docker.createContainer({
+  // 伪装成真实有线网卡 MAC（厂商 OUI），替代容器默认的本地管理位 MAC。
+  const mac = realisticMac(inst.id);
+  const createOpts: Docker.ContainerCreateOptions = {
     name: inst.containerName,
     Image: WECHAT_IMAGE,
     // 内部 hostname 伪装成"个人电脑"名（不再用 woc-wx-<hex>，那是容器/服务器特征）。
@@ -150,7 +167,14 @@ export async function runInstance(inst: Instance): Promise<void> {
     Env: envList(inst),
     ExposedPorts: { '3000/tcp': {} },
     HostConfig: hostConfig,
-  });
+  };
+  // 自定义网络时，MAC 须写到对应 endpoint 上（新版 docker 弃用顶层 MacAddress）；默认网络则用顶层。
+  if (net) {
+    createOpts.NetworkingConfig = { EndpointsConfig: { [net]: { MacAddress: mac } as any } };
+  } else {
+    (createOpts as any).MacAddress = mac;
+  }
+  const container = await docker.createContainer(createOpts);
   try {
     await container.start();
   } catch (e) {
@@ -305,6 +329,42 @@ export async function instanceMemoryMB(inst: Instance): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+// 响应性健康探测：实测发现容器跑久了会出现 I/O / 服务 stall —— 进程没死、面板显示"在线"，
+// 但读不出 VNC 客户端静态文件（nginx 报 upstream timed out），浏览器永远卡在"正在连接桌面"。
+// 这里带注入鉴权请求真正会卡的那条路径（/vnc/index.html，经 nginx→kclient 静态serve），
+// 超时即判不健康。无鉴权时 nginx 直接 401（很快），故必须注入鉴权让请求真正打到 kclient 静态层。
+export async function instanceHttpHealthy(inst: Instance, timeoutMs = 8000): Promise<boolean> {
+  const auth = 'Basic ' + Buffer.from(`${inst.kasmUser}:${inst.kasmPassword}`).toString('base64');
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    const req = http.get(
+      {
+        host: inst.containerName,
+        port: 3000,
+        path: '/vnc/index.html',
+        headers: { authorization: auth },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        // 拿到响应头即说明 nginx+kclient 静态serve 活着（健康时为 200）。读掉 body 释放连接。
+        const ok = !!res.statusCode && res.statusCode < 500;
+        res.resume();
+        done(ok);
+      },
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      done(false); // 超时 = stall，判不健康
+    });
+    req.on('error', () => done(false));
+  });
 }
 
 export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
@@ -463,10 +523,26 @@ export async function downloadFromInstance(inst: Instance, name: string): Promis
     stream.on('error', reject);
   });
   const tar = Buffer.concat(chunks);
-  if (tar.length < 512) return Buffer.alloc(0);
-  const sizeStr = tar.toString('ascii', 124, 135).replace(/\0/g, '').trim();
-  const size = parseInt(sizeStr, 8) || 0;
-  return tar.subarray(512, 512 + size);
+  // 解析 tar，定位真正的普通文件块。Docker(Go archive/tar) 在 mtime 含纳秒精度等情况下会先写一个
+  // PAX 扩展头块（typeflag 'x'），旧代码误把它当文件头、读到的是扩展记录长度 → 返回错误长度的数据
+  // （"大小不对"）。这里跳过 PAX/全局('x'/'g')与 GNU 长名('L'/'K')等扩展头，找到普通文件('0'/NUL)再取内容。
+  let off = 0;
+  while (off + 512 <= tar.length) {
+    const header = tar.subarray(off, off + 512);
+    let allZero = true;
+    for (let i = 0; i < 512; i++) if (header[i] !== 0) { allZero = false; break; }
+    if (allZero) break; // 归档结束（全零块）
+    const sizeStr = header.toString('ascii', 124, 136).replace(/[^0-7]/g, '');
+    const size = sizeStr ? parseInt(sizeStr, 8) : 0;
+    const typeflag = header[156]; // '0'(0x30) 或 NUL(0) = 普通文件
+    const dataStart = off + 512;
+    if (typeflag === 0x30 || typeflag === 0) {
+      return tar.subarray(dataStart, dataStart + size);
+    }
+    // 扩展头/目录等：跳过其数据块（向上对齐 512）后继续
+    off = dataStart + size + ((512 - (size % 512)) % 512);
+  }
+  return Buffer.alloc(0);
 }
 
 // 拉取实例容器日志（末尾 N 行），供前端"查看/导出日志"排错。

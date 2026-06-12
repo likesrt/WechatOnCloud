@@ -4,6 +4,7 @@ import { api } from '../api';
 import { useUI } from '../ui';
 import { useAuth } from '../auth';
 import { useInstances } from '../AppShell';
+import { VncAudio } from '../vncAudio';
 
 // KasmVNC noVNC 页面；反代按实例隔离：/desktop/<id>/* → 对应容器，注入凭据。
 function desktopUrl(id: string) {
@@ -39,11 +40,16 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const isAdmin = user?.role === 'admin';
 
   const [frameLoaded, setFrameLoaded] = useState(false);
+  const [loadStuck, setLoadStuck] = useState(false); // iframe 久未加载出来（疑似实例无响应）
   const [dragging, setDragging] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [files, setFiles] = useState<TFile[]>([]);
   const [showClip, setShowClip] = useState(false);
   const [clipText, setClipText] = useState('');
+  // 中文输入条：面板里的真实 textarea（原生客户端输入法 100% 可用），回车经 xclip+xdotool 粘进微信。
+  const [imeBar, setImeBar] = useState(true); // 默认开（直接在 VNC 里打中文不稳，给一个可靠通道）
+  const [imeText, setImeText] = useState('');
+  const [imeSending, setImeSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [starting, setStarting] = useState(false);
   const [control, setControl] = useState<{ free: boolean; mine: boolean; holder: string | null } | null>(null);
@@ -52,7 +58,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const frameRef = useRef<HTMLIFrameElement>(null);
   const dragDepth = useRef(0);
   const lastBeat = useRef(0);
-  const lastImeError = useRef(0);
+  const audioRef = useRef<VncAudio | null>(null);
 
   const inst = instances.find((i) => i.id === id);
   // 进入实例时，共享列表可能尚未同步（管理页新建/安装后），先按"探测中"显示加载态，
@@ -65,12 +71,23 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   // 切换实例时重置内嵌态
   useEffect(() => {
     setFrameLoaded(false);
+    setLoadStuck(false);
     setShowFiles(false);
     setFiles([]);
     setShowClip(false);
     setClipText('');
+    setImeText('');
     setProbing(true);
   }, [id]);
+
+  // 桌面久未加载出来 → 判为"无响应"，把无限转圈换成可操作的重试/重启，不让用户干等。
+  // （实测容器跑久了会 I/O/服务 stall，进程没死、显示在线，但读不出 VNC 文件而永远连接中。）
+  useEffect(() => {
+    setLoadStuck(false);
+    if (!showVnc || frameLoaded) return;
+    const t = window.setTimeout(() => setLoadStuck(true), 12000);
+    return () => window.clearTimeout(t);
+  }, [showVnc, frameLoaded, id, vncNonce]);
 
   // 探测态收敛：找到实例即结束；否则给共享列表一点刷新时间（AppShell 已在导航时拉取），超时仍无则判定不存在。
   useEffect(() => {
@@ -186,6 +203,42 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     };
   }, [showVnc, id, frameLoaded]);
 
+  // 每次进入/重连桌面前，强制把 KasmVNC 的 enable_ime 设为【关】。
+  // 原因：开启 IME 模式后，noVNC 用隐藏 textarea + 合成事件还原中文，需要前端拦截/差分，环环相扣极脆，
+  // 实测会"中文混数字时丢最后两个汉字+首个数字"等损坏。中文输入改由底部「中文输入条」可靠承担
+  // （面板真实 textarea 原生输入法 → xclip+xdotool 粘贴），故 VNC 直接打字回归纯 keysym：英文/数字/
+  // 标点都正常、不再损坏；中文直接打不进（请用输入条）。iframe 同源共享 localStorage，加载前设好即生效。
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('enable_ime', 'false');
+    } catch {
+      /* 隐私模式等禁用 localStorage：忽略 */
+    }
+  }, [id, vncNonce]);
+
+  // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
+  // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
+  useEffect(() => {
+    if (!showVnc || !id) return;
+    const audio = new VncAudio(id);
+    audioRef.current = audio;
+    audio.connect();
+    const isFocused = () => !document.hidden && document.hasFocus();
+    const sync = () => audio.setActive(isFocused());
+    sync(); // 初始：若当前已聚焦则立即开声
+    document.addEventListener('visibilitychange', sync);
+    window.addEventListener('focus', sync);
+    window.addEventListener('blur', sync);
+    return () => {
+      document.removeEventListener('visibilitychange', sync);
+      window.removeEventListener('focus', sync);
+      window.removeEventListener('blur', sync);
+      audio.destroy();
+      audioRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showVnc, id]);
+
   if (!id) {
     nav('/', { replace: true });
     return null;
@@ -270,92 +323,6 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
-  // 中文 IME 输入修复：绕过 VNC XKB keysym 容量限制（~21 个 CJK 字符后 keymap 满，输入全废）。
-  // 根因：KasmVNC 的 Perl 补丁在 compositionend 发 CJK keysym，但紧随其后的 _handleInput
-  // diff 逻辑会发 Backspace 清拼音，把刚发的字也删了。必须在捕获阶段拦截，阻止 Perl 补丁执行，
-  // 手动重置内部状态（防止 _handleInput 发 Backspace），然后通过 API 用 xdotool 粘贴文字。
-  const patchVncIme = () => {
-    try {
-      const doc = frameRef.current?.contentDocument;
-      if (!doc || doc.getElementById('woc-ime-patch')) return;
-      const ta = doc.getElementById('noVNC_keyboardinput') as HTMLTextAreaElement | null;
-      if (!ta) return;
-      const win = frameRef.current?.contentWindow as any;
-      let imeComposing = false;
-      let swallowInputUntil = 0;
-      const keyboard = () => {
-        const cv = doc.querySelector('canvas') as any;
-        return win?.UI?.rfb?.keyboard || cv?._rfb?.keyboard || null;
-      };
-      const installKeyboardGuard = () => {
-        const kb = keyboard() as any;
-        if (!kb || kb._wocImeGuard || typeof kb._sendKeyEvent !== 'function') return;
-        const original = kb._sendKeyEvent.bind(kb);
-        kb._wocImeGuard = true;
-        if (typeof kb._wocImeSuppressUnicode !== 'boolean') kb._wocImeSuppressUnicode = false;
-        kb._sendKeyEvent = (keysym: number, ...args: any[]) => {
-          if (kb._wocImeSuppressUnicode && typeof keysym === 'number' && keysym >= 0x01000000) return;
-          return original(keysym, ...args);
-        };
-      };
-      const syncKeyboardInput = (value: string) => {
-        try {
-          installKeyboardGuard();
-          const kb = keyboard();
-          if (kb) {
-            kb._imeInProgress = false;
-            kb._imeHold = false;
-            kb._lastKeyboardInput = value;
-            if (kb._rfbKeyQueue) kb._rfbKeyQueue.length = 0;
-          }
-        } catch { /* ignore */ }
-      };
-      const swallowNoVncInput = (e: Event) => {
-        if (!imeComposing && Date.now() > swallowInputUntil) return;
-        e.stopImmediatePropagation();
-        syncKeyboardInput((e.target as HTMLTextAreaElement).value);
-      };
-      ta.addEventListener('compositionstart', (e) => {
-        imeComposing = true;
-        const kb = keyboard() as any;
-        if (kb) kb._wocImeSuppressUnicode = true;
-        e.stopImmediatePropagation();
-        syncKeyboardInput((e.target as HTMLTextAreaElement).value);
-      }, true);
-      ta.addEventListener('beforeinput', swallowNoVncInput, true);
-      ta.addEventListener('input', swallowNoVncInput, true);
-      ta.addEventListener('compositionend', (e) => {
-        const text = (e as CompositionEvent).data;
-        if (!text || !id) return;
-        imeComposing = false;
-        swallowInputUntil = Date.now() + 300;
-        e.stopImmediatePropagation(); // 阻止 KasmVNC 原生 IME 路径再发一遍 keysym
-        const kb = keyboard() as any;
-        if (kb) kb._wocImeSuppressUnicode = true;
-        syncKeyboardInput((e.target as HTMLTextAreaElement).value);
-        window.setTimeout(() => {
-          ta.value = '';
-          syncKeyboardInput('');
-          const kb = keyboard() as any;
-          if (kb) kb._wocImeSuppressUnicode = false;
-        }, 0);
-        // 通过面板 API → xdotool 在容器内粘贴，完全绕过 VNC keysym
-        api.typeInInstance(id, text).catch((err) => {
-          const now = Date.now();
-          if (now - lastImeError.current > 3000) {
-            lastImeError.current = now;
-            toast(err?.message || '中文输入失败，请确认实例镜像包含 xclip/xdotool', 'error');
-          }
-        });
-      }, true); // capture：先于 Perl 补丁的 bubble handler
-      const mark = doc.createElement('meta');
-      mark.id = 'woc-ime-patch';
-      (doc.head || doc.documentElement).appendChild(mark);
-    } catch {
-      /* ignore */
-    }
-  };
-
   // 跨设备剪贴板（文本）：通过同源 iframe 直接喂给 KasmVNC 自带的剪贴板 textarea 并触发其发送逻辑
   // （内部走 RFB.clipboardPasteFrom → clientCutText）。不依赖浏览器异步剪贴板 API，故 http/局域网 IP 下也可用，
   // 规避了"非安全上下文禁用 navigator.clipboard 导致粘贴失败"的问题。文本会进入容器系统剪贴板，
@@ -383,6 +350,22 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       toast('已发送到容器剪贴板，请在微信输入框按 Ctrl+V 粘贴', 'ok');
     } else {
       toast('发送失败：桌面尚未连接', 'error');
+    }
+  };
+
+  // 中文输入条发送：把本框文本经 xclip+xdotool 直接粘进微信当前聚焦的输入框（绕开 VNC IME）。
+  // 在面板的真实 textarea 里用原生输入法打字，100% 可靠，不依赖 VNC 的 enable_ime / 合成事件。
+  const sendImeText = async () => {
+    const t = imeText;
+    if (!t.trim() || !id) return;
+    setImeSending(true);
+    try {
+      await api.typeInInstance(id, t);
+      setImeText('');
+    } catch (e: any) {
+      toast(e?.message || '发送失败：请确认实例已「升级实例」（镜像含 xclip/xdotool）', 'error');
+    } finally {
+      setImeSending(false);
     }
   };
 
@@ -464,6 +447,13 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               }}
             >
               文件
+            </button>
+            <button
+              className={'ws-action' + (imeBar ? ' on' : '')}
+              title="底部中文输入条：用本机输入法打中文，回车送进微信（最可靠）"
+              onClick={() => setImeBar((v) => !v)}
+            >
+              中文输入
             </button>
             <button
               className="ws-action"
@@ -548,7 +538,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
           </div>
         </div>
       ) : (
-        <div className="iv-stage">
+        <div className="iv-stage iv-stage--vnc">
+          <div className="iv-canvas">
           <iframe
             key={`${id}:${vncNonce}`}
             ref={frameRef}
@@ -559,22 +550,50 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             onLoad={() => {
               setFrameLoaded(true);
               setTimeout(() => {
-                focusFrame(); // 加载完把键盘焦点交给 VNC（宿主机输入法）
+                focusFrame(); // 加载完把键盘焦点交给 VNC
                 injectVncStyle(); // 让原生控制条在深色背景下可见
-                patchVncIme(); // 修复中文 IME 吞字（绕过 VNC XKB keysym 限制）
+                // 注意：不再调用 patchVncIme —— enable_ime 已关，直接打字走纯 keysym（英文/数字正常）；
+                // 中文由底部「中文输入条」承担。那套合成拦截既脆弱又会损坏混合输入，已弃用。
               }, 500);
             }}
           />
 
-          {!frameLoaded && (
+          {!frameLoaded && !loadStuck && (
             <div className="iv-loading">
               <div className="spinner" />
               <div className="iv-loading-text">正在连接桌面…</div>
               <div className="iv-loading-sub">首次进入请扫码登录微信</div>
-              <div className="iv-loading-sub">拖文件到此处即可上传；音频/剪贴板等在画面左侧边缘的工具条里</div>
+              <div className="iv-loading-sub">拖文件到此处即可上传；声音自动开启，点一下画面即可出声</div>
               {!window.isSecureContext && (
                 <div className="iv-loading-warn">当前非 HTTPS 访问，浏览器将禁用麦克风与摄像头（音频播放不受影响）</div>
               )}
+            </div>
+          )}
+
+          {!frameLoaded && loadStuck && (
+            <div className="iv-loading">
+              <div className="iv-loading-text">桌面无响应</div>
+              <div className="iv-loading-sub">连接超时。可能是实例临时卡住，先「重新连接」；若仍无效请「重启实例」。</div>
+              <div className="iv-stuck-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={() => {
+                    setLoadStuck(false);
+                    setFrameLoaded(false);
+                    setVncNonce((n) => n + 1); // 强制 iframe 重挂、重新请求
+                  }}
+                >
+                  重新连接
+                </button>
+                {isAdmin && (
+                  <button className="btn" onClick={restartInstance}>
+                    重启实例
+                  </button>
+                )}
+              </div>
+              <div className="iv-loading-sub" style={{ marginTop: 8 }}>
+                管理员也可稍候，面板会自动检测无响应实例并重启自愈。
+              </div>
             </div>
           )}
 
@@ -667,6 +686,32 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               <div className="files-hint">
                 局域网 http 访问时浏览器会禁用系统级剪贴板同步，故用此框中转：文本→容器剪贴板，再在微信里 Ctrl+V。
               </div>
+            </div>
+          )}
+          </div>
+
+          {imeBar && (
+            <div className="iv-imebar">
+              <textarea
+                className="iv-imebar-input"
+                value={imeText}
+                onChange={(e) => setImeText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendImeText();
+                  }
+                }}
+                placeholder="中文输入这里 → 回车送进微信（先点好微信的输入框）。Shift+回车换行。"
+                rows={1}
+              />
+              <button
+                className="btn btn-primary iv-imebar-send"
+                disabled={imeSending || !imeText.trim()}
+                onClick={sendImeText}
+              >
+                {imeSending ? '发送中' : '发送'}
+              </button>
             </div>
           )}
         </div>

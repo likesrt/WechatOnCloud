@@ -53,10 +53,11 @@ import {
   listOrphanContainers,
   removeContainerById,
   instanceMemoryMB,
+  instanceHttpHealthy,
   regenInstanceMachineId,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
-import { parseHost, parseAllowedHosts, isAllowedHost } from './host-guard.js';
+import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -82,14 +83,14 @@ const app = Fastify({ logger: true, trustProxy: true });
 // RFC1918 LAN address nor in PANEL_ALLOWED_HOSTS. Runs before every route so
 // /api/*, /desktop/* and static-file responses are all covered.
 app.addHook('onRequest', async (req, reply) => {
-  const host = parseHost(req.headers.host);
-  if (!isAllowedHost(host, ALLOWED_HOSTS)) {
-    // 把被拒的 host 一起回显，反代调试时可一眼看出"反代后端实际传过来的 Host 是什么"
-    // —— 决定是去白名单加这个 host，还是修反代让它透传客户端 Host。不泄露敏感信息。
+  if (!isRequestHostAllowed(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS)) {
+    // 把被拒的 Host / X-Forwarded-Host 一起回显，反代调试时可一眼看出"后端实际收到的是什么"
+    // —— 决定是去白名单加这个 host，还是修反代让它透传 Host。不泄露敏感信息。
     reply.code(400).send({
       error: 'Host header not allowed',
-      host: host || null,
-      hint: '反代部署请把对外域名加入 PANEL_ALLOWED_HOSTS（.env，逗号分隔多个域名），或修反代让 Host 头透传',
+      host: parseHost(req.headers.host) || null,
+      forwardedHost: req.headers['x-forwarded-host'] || null,
+      hint: '反代部署请把对外域名加入 PANEL_ALLOWED_HOSTS（.env 逗号分隔，支持 *.example.com），改完用 docker compose up -d 重建容器（不是 restart）使其生效',
     });
   }
 });
@@ -757,7 +758,7 @@ await app.ready();
 app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
   // DNS-rebinding gate for WebSocket upgrades (Fastify's onRequest hook does
   // not run on raw upgrades). KasmVNC proxying goes through this path.
-  if (!isAllowedHost(parseHost(req.headers.host), ALLOWED_HOSTS)) {
+  if (!isRequestHostAllowed(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS)) {
     socket.destroy();
     return;
   }
@@ -825,45 +826,62 @@ function hasActiveSession(id: string): boolean {
 
 if (WATCHDOG_ENABLED) {
   const recovering = new Set<string>(); // 防重入：自愈期间跳过本实例
+  const healthFails = new Map<string, number>(); // id → 连续无响应次数
+  const HEALTH_FAIL_LIMIT = 2; // 连续 N 次无响应才重启，避免误杀刚启动/瞬时抖动
+
+  const recover = async (inst: Instance, reason: string, detail: string) => {
+    recovering.add(inst.id);
+    app.log.warn(`[watchdog] ${inst.containerName} ${detail}`);
+    try {
+      await stopInstance(inst);
+      await runInstance(inst);
+      healthFails.delete(inst.id);
+      app.log.info(`[watchdog] ${inst.containerName} 自愈完成（${reason}）`);
+    } catch (e: any) {
+      app.log.error(`[watchdog] ${inst.containerName} 自愈失败（${reason}）: ${e?.message || e}`);
+    } finally {
+      recovering.delete(inst.id);
+    }
+  };
+
   const tick = async () => {
     for (const pub of listInstances()) {
       const inst = findInstance(pub.id);
       if (!inst || recovering.has(inst.id)) continue;
       try {
-        if ((await instanceRuntime(inst)) !== 'running') continue;
-        const mb = await instanceMemoryMB(inst);
-        if (mb === 0) continue;
-        const { soft, hard } = effectiveLimits(inst);
-        const active = hasActiveSession(inst.id);
-        let reason: 'hard' | 'soft' | null = null;
-        if (hard > 0 && mb >= hard) reason = 'hard';
-        else if (soft > 0 && mb >= soft && !active) reason = 'soft';
-        if (!reason) {
-          if (soft > 0 && mb >= soft && active) {
-            app.log.info(
-              `[watchdog] ${inst.containerName} mem=${mb}MiB ≥ soft=${soft}MiB 但用户在使用（holder=${controlHolders.get(inst.id)?.username}），延后`,
-            );
-          }
+        if ((await instanceRuntime(inst)) !== 'running') {
+          healthFails.delete(inst.id);
           continue;
         }
-        recovering.add(inst.id);
-        if (reason === 'hard') {
-          app.log.warn(
-            `[watchdog] ${inst.containerName} mem=${mb}MiB ≥ hard=${hard}MiB，强制重启（active=${active}）`,
-          );
-        } else {
-          app.log.warn(
-            `[watchdog] ${inst.containerName} mem=${mb}MiB ≥ soft=${soft}MiB 且无活跃会话，柔和重启`,
-          );
+        // 1) 内存阈值自愈（既有）：hard 强制 / soft 仅在无人会话时
+        const mb = await instanceMemoryMB(inst);
+        if (mb > 0) {
+          const { soft, hard } = effectiveLimits(inst);
+          const active = hasActiveSession(inst.id);
+          if (hard > 0 && mb >= hard) {
+            await recover(inst, 'hard', `mem=${mb}MiB ≥ hard=${hard}MiB，强制重启（active=${active}）`);
+            continue;
+          }
+          if (soft > 0 && mb >= soft && !active) {
+            await recover(inst, 'soft', `mem=${mb}MiB ≥ soft=${soft}MiB 且无活跃会话，柔和重启`);
+            continue;
+          }
+          if (soft > 0 && mb >= soft && active) {
+            app.log.info(`[watchdog] ${inst.containerName} mem=${mb}MiB ≥ soft=${soft}MiB 但用户在使用，延后`);
+          }
         }
-        try {
-          await stopInstance(inst);
-          await runInstance(inst);
-          app.log.info(`[watchdog] ${inst.containerName} 自愈完成（${reason}）`);
-        } catch (e: any) {
-          app.log.error(`[watchdog] ${inst.containerName} 自愈失败（${reason}）: ${e?.message || e}`);
-        } finally {
-          recovering.delete(inst.id);
+        // 2) 响应性自愈（新）：探测 VNC 是否还能提供页面；连续 N 次无响应 → 重启
+        //    应对"进程没死、显示在线，但 I/O/服务 stall 读不出 VNC 文件、永远卡在正在连接桌面"。
+        const healthy = await instanceHttpHealthy(inst);
+        if (healthy) {
+          healthFails.delete(inst.id);
+          continue;
+        }
+        const fails = (healthFails.get(inst.id) || 0) + 1;
+        healthFails.set(inst.id, fails);
+        app.log.warn(`[watchdog] ${inst.containerName} VNC 无响应（连续 ${fails}/${HEALTH_FAIL_LIMIT}）`);
+        if (fails >= HEALTH_FAIL_LIMIT) {
+          await recover(inst, 'unresponsive', `VNC 连续 ${fails} 次无响应（疑似 I/O/服务 stall），自愈重启`);
         }
       } catch (e: any) {
         app.log.warn(`[watchdog] ${pub.id} 检查异常: ${e?.message || e}`);
@@ -872,7 +890,7 @@ if (WATCHDOG_ENABLED) {
   };
   setInterval(() => void tick(), WATCHDOG_INTERVAL_SEC * 1000).unref();
   console.log(
-    `[watchdog] 已启用 · soft=${DEFAULT_SOFT_MB} MiB · hard=${DEFAULT_HARD_MB} MiB · 间隔=${WATCHDOG_INTERVAL_SEC}s`,
+    `[watchdog] 已启用 · soft=${DEFAULT_SOFT_MB} MiB · hard=${DEFAULT_HARD_MB} MiB · 间隔=${WATCHDOG_INTERVAL_SEC}s · 含响应性探测`,
   );
 }
 
