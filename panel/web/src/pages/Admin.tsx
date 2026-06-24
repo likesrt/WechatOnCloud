@@ -265,6 +265,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [securityInst, setSecurityInst] = useState<InstanceWithStatus | null>(null); // 安全（内存阈值）弹窗
   const [volumeInst, setVolumeInst] = useState<InstanceWithStatus | null>(null); // 数据卷管理弹窗
   const [iconInst, setIconInst] = useState<InstanceWithStatus | null>(null); // 图标编辑弹窗
+  const [proxyInst, setProxyInst] = useState<InstanceWithStatus | null>(null); // 代理编辑弹窗
   const [acting, setActing] = useState<Record<string, string>>({}); // 实例 id → 进行中的动作文案（启动中/升级中…）
   // 未使用的旧数据卷（来自之前删实例时未勾选"彻底清除"）：允许复用以继承聊天记录，或显式删除。
   const [orphanVols, setOrphanVols] = useState<{ name: string; createdAt?: string; sizeBytes?: number }[]>([]);
@@ -477,6 +478,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                     onSecurity={() => setSecurityInst(inst)}
                     onVolume={() => setVolumeInst(inst)}
                     onIcon={() => setIconInst(inst)}
+                    onProxy={() => setProxyInst(inst)}
                   />
                 ))}
               </div>
@@ -713,6 +715,13 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
             toast('已更新图标', 'ok');
             load();
           }}
+        />
+      )}
+      {proxyInst && (
+        <ProxyEditor
+          inst={proxyInst}
+          onClose={() => setProxyInst(null)}
+          onDone={() => { setProxyInst(null); load(); }}
         />
       )}
     </div>
@@ -1051,6 +1060,7 @@ function InstanceAdminCard({
   onSecurity,
   onVolume,
   onIcon,
+  onProxy,
 }: {
   inst: InstanceWithStatus;
   userCount: number;
@@ -1067,6 +1077,7 @@ function InstanceAdminCard({
   onSecurity: () => void;
   onVolume: () => void;
   onIcon: () => void;
+  onProxy: () => void;
 }) {
   const wx = inst.wechat;
   const busy = BUSY_PHASES.includes(wx.phase);
@@ -1185,6 +1196,9 @@ function InstanceAdminCard({
                   </button>
                   <button className="btn-text" onClick={onIcon} title="设置实例图标：内置图标 / 上传图片裁剪">
                     图标
+                  </button>
+                  <button className="btn-text" onClick={onProxy} title="配置实例代理服务器">
+                    代理
                   </button>
                   <button className="btn-text" onClick={onVolume} title="数据卷：备份/恢复、上传 PC 微信数据、文件管理">
                     数据卷
@@ -1684,6 +1698,79 @@ function CreateUser({ instances, onClose, onDone }: { instances: InstanceWithSta
   );
 }
 
+/** 实例代理配置弹窗。修改后需重启实例生效。 */
+function ProxyEditor({ inst, onClose, onDone }: { inst: InstanceWithStatus; onClose: () => void; onDone: () => void }) {
+  const { toast } = useUI();
+  const hasProxy = !!inst.proxy;
+  const [type, setType] = useState<'http' | 'socks5'>(inst.proxy?.type || 'http');
+  const [host, setHost] = useState(inst.proxy?.host || '');
+  const [port, setPort] = useState(inst.proxy?.port ? String(inst.proxy.port) : '');
+  const [username, setUsername] = useState(inst.proxy?.username || '');
+  const [password, setPassword] = useState(''); // 不回显原密码
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      const cfg = host && port
+        ? { type, host, port: Number(port), ...(username ? { username } : {}), ...(password ? { password } : {}) }
+        : null;
+      const r = await api.setInstanceProxy(inst.id, cfg);
+      toast(r.message || '已保存', 'ok');
+      onDone();
+    } catch (e: any) {
+      setErr(e.message || '保存失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+        <h2>代理设置 — {inst.name}</h2>
+        <div className="proxy-fields">
+          <div className="proxy-row">
+            <select className="proxy-sel" value={type} onChange={(e) => setType(e.target.value as any)}>
+              <option value="http">HTTP</option>
+              <option value="socks5">SOCKS5</option>
+            </select>
+            <input className="input proxy-addr" placeholder="代理地址" value={host} onChange={(e) => setHost(e.target.value)} />
+            <input className="input proxy-port" placeholder="端口" type="number" value={port} onChange={(e) => setPort(e.target.value)} />
+          </div>
+          <div className="proxy-row">
+            <input className="input proxy-auth" placeholder="用户名（可选）" autoCapitalize="off" value={username} onChange={(e) => setUsername(e.target.value)} />
+            <PasswordInput placeholder={hasProxy ? '新密码（留空不变）' : '密码（可选）'} value={password} onChange={setPassword} />
+          </div>
+        </div>
+        <p className="s-foot" style={{ marginTop: 8 }}>修改后需<b>重启实例</b>生效。代理仅影响 Chromium / Telegram 等应用，微信不受影响。</p>
+        {err && <div className="error">{err}</div>}
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onClose}>取消</button>
+          {hasProxy && (
+            <button type="button" className="btn btn-danger" disabled={busy} onClick={async () => {
+              setBusy(true);
+              try {
+                const r = await api.setInstanceProxy(inst.id, null);
+                toast(r.message || '代理已清除', 'ok');
+                onDone();
+              } catch (e: any) {
+                setErr(e.message || '清除失败');
+              } finally {
+                setBusy(false);
+              }
+            }}>清除代理</button>
+          )}
+          <button className="btn btn-primary" disabled={busy}>保存</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 // 可创建的应用类型。ready=false 的暂时禁用（即将支持）。Telegram（仅 x86_64）与其它应用暂缓。
 const APP_OPTIONS: { type: AppType; desc: string; ready: boolean }[] = [
   { type: 'wechat', desc: '默认', ready: true },
@@ -1697,6 +1784,11 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  // 代理配置（默认折叠）
+  const [proxyOpen, setProxyOpen] = useState(false);
+  const [proxy, setProxy] = useState<{ type: 'http' | 'socks5'; host: string; port: string; username: string; password: string }>({
+    type: 'http', host: '', port: '', username: '', password: '',
+  });
   // 未使用的旧数据卷（之前删除实例但未勾选「彻底清除」时保留下来的），允许在此复用以继承聊天记录。
   const [orphans, setOrphans] = useState<{ name: string; createdAt?: string }[]>([]);
   const [reuse, setReuse] = useState<string>(''); // '' = 不复用，新建空卷
@@ -1719,7 +1811,10 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
     setErr('');
     setBusy(true);
     try {
-      await api.createInstance(name.trim(), [...sel], reuse || undefined, appType);
+      const proxyCfg = proxy.host && proxy.port
+        ? { type: proxy.type, host: proxy.host, port: Number(proxy.port), ...(proxy.username ? { username: proxy.username } : {}), ...(proxy.password ? { password: proxy.password } : {}) }
+        : undefined;
+      await api.createInstance(name.trim(), [...sel], reuse || undefined, appType, proxyCfg);
       onDone();
     } catch (e: any) {
       setErr(e.message || '创建失败');
@@ -1748,6 +1843,32 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
             </button>
           ))}
         </div>
+        <button type="button" className="proxy-toggle" onClick={() => setProxyOpen((v) => !v)}>
+          <span>代理设置</span>
+          <span className={'proxy-toggle-arrow' + (proxyOpen ? ' open' : '')}>{CaretIcon}</span>
+          {!proxyOpen && proxy.host && (
+            <span className="proxy-toggle-summary">{proxy.type.toUpperCase()} {proxy.host}:{proxy.port || '?'}</span>
+          )}
+        </button>
+        {proxyOpen && (
+          <div className="proxy-fields">
+            <div className="proxy-row">
+              <select className="proxy-sel" value={proxy.type} onChange={(e) => setProxy((p) => ({ ...p, type: e.target.value as any }))}>
+                <option value="http">HTTP</option>
+                <option value="socks5">SOCKS5</option>
+              </select>
+              <input className="input proxy-addr" placeholder="代理地址" value={proxy.host} onChange={(e) => setProxy((p) => ({ ...p, host: e.target.value }))} />
+              <input className="input proxy-port" placeholder="端口" type="number" value={proxy.port} onChange={(e) => setProxy((p) => ({ ...p, port: e.target.value }))} />
+            </div>
+            <div className="proxy-row">
+              <input className="input proxy-auth" placeholder="用户名（可选）" autoCapitalize="off" value={proxy.username} onChange={(e) => setProxy((p) => ({ ...p, username: e.target.value }))} />
+              <PasswordInput placeholder="密码（可选）" value={proxy.password} onChange={(v) => setProxy((p) => ({ ...p, password: v }))} />
+            </div>
+            <button type="button" className="btn-text" onClick={() => setProxy({ type: 'http', host: '', port: '', username: '', password: '' })}>
+              清除代理
+            </button>
+          </div>
+        )}
         <input className="input" placeholder="实例名称（留空自动命名）" value={name} onChange={(e) => setName(e.target.value)} />
         {appType === 'chromium' && (
           <div className="muted small">Chromium 浏览器随镜像就绪，创建后直接「进入实例」即可（无需下载安装）。</div>

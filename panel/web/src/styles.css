@@ -2273,3 +2273,48 @@ button {
 .icon-pick:active {
   transform: scale(0.96);
 }
+
+/* ---- 代理配置 ---- */
+.proxy-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--c-muted, #888);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 6px 0;
+  width: 100%;
+}
+.proxy-toggle:hover { color: var(--c-text, inherit); }
+.proxy-toggle-arrow {
+  display: inline-flex;
+  transition: transform 0.15s;
+}
+.proxy-toggle-arrow.open { transform: rotate(180deg); }
+.proxy-toggle-summary {
+  font-size: 12px;
+  color: var(--c-accent, #07c);
+  margin-left: auto;
+}
+
+.proxy-fields { display: flex; flex-direction: column; gap: 6px; }
+.proxy-row {
+  display: flex;
+  gap: 6px;
+}
+.proxy-sel {
+  width: 90px;
+  flex-shrink: 0;
+  border: 1px solid var(--c-border, #ddd);
+  border-radius: 6px;
+  background: var(--c-bg, #fff);
+  color: var(--c-text, inherit);
+  font-size: 13px;
+  padding: 0 8px;
+  height: 34px;
+}
+.proxy-addr { flex: 1; }
+.proxy-port { width: 90px; flex-shrink: 0; }
+.proxy-auth { flex: 1; }
