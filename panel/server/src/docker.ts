@@ -103,6 +103,29 @@ function videoDevices(): string[] {
   return [];
 }
 
+/** 将实例代理配置转为容器环境变量列表。无代理时返回空数组。 */
+function proxyEnv(inst: Instance): string[] {
+  const p = inst.proxy;
+  if (!p) return [];
+  const proto = p.type === 'socks5' ? 'socks5' : 'http';
+  // 有认证时嵌入 URL
+  const auth = p.username
+    ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password || '')}@`
+    : '';
+  const addr = `${proto}://${auth}${p.host}:${p.port}`;
+  return [
+    `HTTP_PROXY=${addr}`,
+    `http_proxy=${addr}`,
+    `HTTPS_PROXY=${addr}`,
+    `https_proxy=${addr}`,
+    `ALL_PROXY=${addr}`,
+    `all_proxy=${addr}`,
+    // 排除内部通信：面板↔实例、localhost。防止 KasmVNC 反代走代理导致连不上。
+    `NO_PROXY=localhost,127.0.0.1,::1,*.local`,
+    `no_proxy=localhost,127.0.0.1,::1,*.local`,
+  ];
+}
+
 function envList(inst: Instance): string[] {
   const env = [
     `PUID=${PUID}`,
@@ -124,6 +147,8 @@ function envList(inst: Instance): string[] {
   // 微信等 Chromium 系应用即跟随系统深色）。开关由面板顶栏主题统一控制、持久化在 accounts.json，
   // 运行中的实例则通过 setInstanceDark 实时切换（见下）。
   if (getDesktopDark()) env.push('WOC_DARK=1');
+  // 代理配置：注入 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY 环境变量
+  env.push(...proxyEnv(inst));
   return env;
 }
 
