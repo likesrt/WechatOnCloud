@@ -21,6 +21,9 @@ import {
   listInstances,
   findInstance,
   setInstanceMemLimits,
+  validateProxy,
+  setInstanceProxy,
+  type ProxyConfig,
   userInstances,
   userCanAccess,
   createInstance,
@@ -361,12 +364,22 @@ app.post('/api/instances/:id/clientlog', async (req, reply) => {
 app.post('/api/admin/instances', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const { name, reuseVolume, appType } = (req.body as any) ?? {};
+  const { name, reuseVolume, appType, proxy } = (req.body as any) ?? {};
   const allowedUserIds = Array.isArray((req.body as any)?.allowedUserIds) ? (req.body as any).allowedUserIds : [];
   if (!name || String(name).trim().length === 0 || String(name).length > 30) {
     return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
   }
   const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
+  // 代理配置校验（可选）
+  let proxyCfg: ProxyConfig | undefined;
+  if (proxy !== undefined && proxy !== null) {
+    try {
+      const cfg = validateProxy(proxy);
+      if (cfg) proxyCfg = cfg;
+    } catch (e: any) {
+      return reply.code(400).send({ error: '代理配置：' + (e?.message || '格式不正确') });
+    }
+  }
   // 复用卷：必须以 woc-data- 开头，且不能被现存实例占用。后端先校验，避免坏名穿透到 docker run。
   let reuseVolumeName: string | undefined;
   if (reuseVolume) {
@@ -378,7 +391,7 @@ app.post('/api/admin/instances', async (req, reply) => {
     }
     reuseVolumeName = reuseVolume;
   }
-  const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName, type);
+  const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName, type, proxyCfg);
   appendPanelLog(
     'INFO',
     `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用卷 ${reuseVolumeName}` : ''} → 开始创建容器（镜像缺失会自动拉取，首次较慢）`,
@@ -503,6 +516,26 @@ app.put('/api/admin/instances/:id/mem-limits', async (req, reply) => {
     return { instance: pub };
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '阈值不合法' });
+  }
+});
+
+/** 修改实例代理配置（仅管理员）。修改后需重启实例生效。 */
+app.put('/api/admin/instances/:id/proxy', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  const { proxy } = (req.body as any) ?? {};
+  try {
+    const cfg = validateProxy(proxy);
+    const pub = setInstanceProxy(id, cfg);
+    const label = cfg
+      ? `${cfg.type.toUpperCase()} ${cfg.host}:${cfg.port}`
+      : '已清除';
+    appendPanelLog('INFO', `实例「${inst.name}」(id=${id}) 代理配置：${label}（重启后生效）`);
+    return { instance: pub, message: cfg ? '代理已保存，重启实例后生效' : '代理已清除，重启实例后生效' };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '代理配置不合法' });
   }
 });
 
