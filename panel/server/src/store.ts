@@ -28,6 +28,15 @@ const DEFAULT_ADMIN_PASSWORD = 'wechat';
 // v1.2.0：实例可承载多种应用（不止微信）。同一镜像运行时按 appType 安装/启动对应应用。
 export type AppType = 'wechat' | 'telegram' | 'chromium' | 'custom';
 export const APP_TYPES: AppType[] = ['wechat', 'telegram', 'chromium', 'custom'];
+
+/** 实例代理配置。缺省 = 不设代理（直连）。 */
+export interface ProxyConfig {
+  type: 'http' | 'socks5';
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+}
 export const APP_LABELS: Record<AppType, string> = {
   wechat: '微信',
   telegram: 'Telegram',
@@ -57,6 +66,8 @@ export interface Instance {
   // hard：内存超此值时，无论是否有人在会话都重启（防止 OOM 拖垮宿主）。
   memSoftLimitMB?: number;
   memHardLimitMB?: number;
+  /** 代理配置。缺省 = 不设代理（直连）；修改后重启实例生效。 */
+  proxy?: ProxyConfig;
 }
 
 // 面板级全局设置（持久化进 accounts.json）。
@@ -244,6 +255,8 @@ export function publicInstance(i: Instance) {
     createdBy: i.createdBy,
     memSoftLimitMB: i.memSoftLimitMB,
     memHardLimitMB: i.memHardLimitMB,
+    // 代理配置脱敏返回：密码替换为 ***
+    proxy: i.proxy ? { ...i.proxy, password: i.proxy.password ? '***' : undefined } : undefined,
   };
 }
 
@@ -268,6 +281,45 @@ export function setInstanceMemLimits(
   if (s != null && h != null && s >= h) throw new Error('soft 阈值需小于 hard 阈值');
   inst.memSoftLimitMB = s;
   inst.memHardLimitMB = h;
+  persist();
+  return publicInstance(inst);
+}
+
+/** 校验代理配置。合法则返回 ProxyConfig，非法则 throw。传 null/undefined 返回 null（清除代理）。 */
+export function validateProxy(input: any): ProxyConfig | null {
+  if (input === null || input === undefined) return null;
+  if (typeof input !== 'object') throw new Error('代理配置格式不正确');
+  const { type, host, port, username, password } = input;
+  if (type !== 'http' && type !== 'socks5') throw new Error('代理类型仅支持 http 或 socks5');
+  if (typeof host !== 'string' || host.length === 0 || host.length > 253 || host.includes('://'))
+    throw new Error('代理地址不合法（不含协议头，如 192.168.1.1）');
+  const p = Number(port);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error('端口需为 1-65535');
+  const cfg: ProxyConfig = { type, host, port };
+  if (username !== undefined && username !== null) {
+    if (typeof username !== 'string' || username.length > 128) throw new Error('代理用户名不合法');
+    cfg.username = username;
+  }
+  if (password !== undefined && password !== null) {
+    if (typeof password !== 'string' || password.length > 128) throw new Error('代理密码不合法');
+    cfg.password = password;
+  }
+  return cfg;
+}
+
+/** 设置/清除实例代理配置。proxy 为 null 表示清除。修改后需重启实例生效。 */
+export function setInstanceProxy(id: string, proxy: ProxyConfig | null) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  if (proxy === null) {
+    delete inst.proxy;
+  } else {
+    // 未传密码时保留原密码（修改场景：用户可能只想改地址不改密码）
+    if (!proxy.password && inst.proxy?.password) {
+      proxy.password = inst.proxy.password;
+    }
+    inst.proxy = proxy;
+  }
   persist();
   return publicInstance(inst);
 }
@@ -306,6 +358,7 @@ export function createInstance(
   allowedUserIds: string[] = [],
   reuseVolumeName?: string,
   appType: AppType = 'wechat',
+  proxy?: ProxyConfig,
 ) {
   const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
   let id = randomBytes(5).toString('hex'); // 10 hex chars
@@ -329,6 +382,7 @@ export function createInstance(
     kasmPassword: randomBytes(24).toString('hex'),
     createdAt: new Date().toISOString(),
     createdBy,
+    ...(proxy ? { proxy } : {}),
   };
   data.instances.push(inst);
   // 把访问权限写到选中的账户上
