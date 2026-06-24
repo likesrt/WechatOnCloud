@@ -53,6 +53,8 @@ export interface PanelInstance {
   createdBy: string;
   memSoftLimitMB?: number;
   memHardLimitMB?: number;
+  /** 代理配置（脱敏：password 为 ***）。缺省 = 不设代理。 */
+  proxy?: { type: 'http' | 'socks5'; host: string; port: number; username?: string; password?: string };
 }
 export interface MemLimits {
   soft: number | null;
@@ -156,10 +158,16 @@ export const api = {
 
   // 微信实例
   listInstances: () => req<{ instances: InstanceWithStatus[] }>('/api/instances'),
-  createInstance: (name: string, allowedUserIds: string[] = [], reuseVolume?: string, appType: AppType = 'wechat') =>
+  createInstance: (
+    name: string,
+    allowedUserIds: string[] = [],
+    reuseVolume?: string,
+    appType: AppType = 'wechat',
+    proxy?: { type: 'http' | 'socks5'; host: string; port: number; username?: string; password?: string },
+  ) =>
     req<{ instance: PanelInstance }>('/api/admin/instances', {
       method: 'POST',
-      body: JSON.stringify({ name, allowedUserIds, reuseVolume: reuseVolume || undefined, appType }),
+      body: JSON.stringify({ name, allowedUserIds, reuseVolume: reuseVolume || undefined, appType, proxy }),
     }),
   regenMachineId: (id: string) =>
     req(`/api/admin/instances/${id}/regen-machine-id`, { method: 'POST' }),
@@ -169,6 +177,15 @@ export const api = {
     req<{ instance: PanelInstance }>(`/api/admin/instances/${id}/mem-limits`, {
       method: 'PUT',
       body: JSON.stringify({ soft, hard }),
+    }),
+  /** 设置/清除实例代理配置。proxy 为 null 表示清除。修改后需重启实例生效。 */
+  setInstanceProxy: (
+    id: string,
+    proxy: { type: 'http' | 'socks5'; host: string; port: number; username?: string; password?: string } | null,
+  ) =>
+    req<{ instance: PanelInstance; message: string }>(`/api/admin/instances/${id}/proxy`, {
+      method: 'PUT',
+      body: JSON.stringify({ proxy }),
     }),
   listOrphanVolumes: () =>
     req<{ volumes: { name: string; createdAt?: string; sizeBytes?: number }[] }>('/api/admin/orphan-volumes'),
