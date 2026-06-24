@@ -25,10 +25,20 @@ woc_app_def "$APP_TYPE"
 # 里手动选（设置随数据卷持久化）。
 if { [ "${WOC_DARK:-}" = "1" ] || [ "${WOC_DARK:-}" = "true" ]; } && [ "$APP_TYPE" = "chromium" ]; then
     APP_LAUNCH="${APP_LAUNCH} --force-dark-mode --enable-features=WebContentsForceDark"
-    echo "[autostart] 浏览器深色已启用（--force-dark-mode）"
+    echo “[autostart] 浏览器深色已启用（--force-dark-mode）”
 fi
 
-# 防“最小化后丢失”：本桌面（openbox）无任务栏，窗口被最小化就无处恢复 → 黑屏。
+# 代理：Chromium 额外加 --proxy-server 旗标（比环境变量更可靠）。
+# Telegram 桌面版吃系统 HTTP_PROXY 环境变量，无需额外处理。
+if [ “$APP_TYPE” = “chromium” ] && [ -n “${HTTP_PROXY:-}” ]; then
+    APP_LAUNCH=”${APP_LAUNCH} --proxy-server=${HTTP_PROXY}”
+    echo “[autostart] 代理已启用：--proxy-server=${HTTP_PROXY}”
+elif [ “$APP_TYPE” = “chromium” ] && [ -n “${ALL_PROXY:-}” ]; then
+    APP_LAUNCH=”${APP_LAUNCH} --proxy-server=${ALL_PROXY}”
+    echo “[autostart] 代理已启用：--proxy-server=${ALL_PROXY}”
+fi
+
+# 防”最小化后丢失”：本桌面（openbox）无任务栏，窗口被最小化就无处恢复 → 黑屏。
 # 看守进程：每 2s 把“被最小化（不可见）”的顶层窗口重新激活，相当于禁用最小化。对任意应用通用。
 (
     export DISPLAY="${DISPLAY:-:1}"
