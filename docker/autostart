@@ -28,14 +28,12 @@ if { [ "${WOC_DARK:-}" = "1" ] || [ "${WOC_DARK:-}" = "true" ]; } && [ "$APP_TYP
     echo “[autostart] 浏览器深色已启用（--force-dark-mode）”
 fi
 
-# 代理：Chromium 额外加 --proxy-server 旗标（比环境变量更可靠）。
-# Telegram 桌面版吃系统 HTTP_PROXY 环境变量，无需额外处理。
-if [ “$APP_TYPE” = “chromium” ] && [ -n “${HTTP_PROXY:-}” ]; then
-    APP_LAUNCH=”${APP_LAUNCH} --proxy-server=${HTTP_PROXY}”
-    echo “[autostart] 代理已启用：--proxy-server=${HTTP_PROXY}”
-elif [ “$APP_TYPE” = “chromium” ] && [ -n “${ALL_PROXY:-}” ]; then
-    APP_LAUNCH=”${APP_LAUNCH} --proxy-server=${ALL_PROXY}”
-    echo “[autostart] 代理已启用：--proxy-server=${ALL_PROXY}”
+# 代理：Chromium 使用环境变量 HTTP_PROXY/HTTPS_PROXY（支持内嵌认证）。
+# Telegram 桌面版也吃系统 HTTP_PROXY 环境变量，无需额外处理。
+# 注意：--proxy-server 旗标不支持内嵌的 user:pass@，会导致浏览器反复弹认证框；
+# 而环境变量格式 http://user:pass@host:port 可被 Chromium 正确解析并自动认证。
+if [ "$APP_TYPE" = "chromium" ] && [ -n "${HTTP_PROXY:-}" ]; then
+    echo "[autostart] 代理已启用（通过环境变量 HTTP_PROXY，自动认证）"
 fi
 
 # 防”最小化后丢失”：本桌面（openbox）无任务栏，窗口被最小化就无处恢复 → 黑屏。
