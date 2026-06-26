@@ -16,6 +16,7 @@ import {
   createSub,
   setDisabled,
   resetPassword,
+  renameUser,
   deleteUser,
   setUserInstances,
   listInstances,
@@ -288,6 +289,21 @@ app.post('/api/admin/users/:id/reset', async (req, reply) => {
     const user = resetPassword(id, newPassword);
     destroyUserSessions(id);
     return { user };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+// 改用户名（登录名）。会话以 userId 为准，改名后保持登录、下次用新名登录即可。
+app.post('/api/admin/users/:id/rename', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const { username } = (req.body as any) ?? {};
+  const id = (req.params as any).id;
+  if (!username || !/^[a-zA-Z0-9_]{3,20}$/.test(username)) {
+    return reply.code(400).send({ error: '用户名为 3-20 位字母、数字或下划线' });
+  }
+  try {
+    return { user: renameUser(id, username) };
   } catch (e: any) {
     return reply.code(400).send({ error: e.message });
   }

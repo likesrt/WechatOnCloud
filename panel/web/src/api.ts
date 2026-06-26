@@ -152,6 +152,8 @@ export const api = {
     req<{ user: PanelUser }>(`/api/admin/users/${id}/disable`, { method: 'POST', body: JSON.stringify({ disabled }) }),
   resetUser: (id: string, newPassword: string) =>
     req<{ user: PanelUser }>(`/api/admin/users/${id}/reset`, { method: 'POST', body: JSON.stringify({ newPassword }) }),
+  renameUser: (id: string, username: string) =>
+    req<{ user: PanelUser }>(`/api/admin/users/${id}/rename`, { method: 'POST', body: JSON.stringify({ username }) }),
   deleteUser: (id: string) => req(`/api/admin/users/${id}`, { method: 'DELETE' }),
   setUserInstances: (id: string, instanceIds: string[]) =>
     req<{ user: PanelUser }>(`/api/admin/users/${id}/instances`, { method: 'POST', body: JSON.stringify({ instanceIds }) }),

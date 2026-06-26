@@ -260,6 +260,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [assignInst, setAssignInst] = useState<InstanceWithStatus | null>(null); // 给实例选账户
   const [assignUser, setAssignUser] = useState<PanelUser | null>(null); // 给账户选实例
   const [resetTarget, setResetTarget] = useState<PanelUser | null>(null); // 重置密码弹窗
+  const [renameUserTarget, setRenameUserTarget] = useState<PanelUser | null>(null); // 改用户名弹窗
   const [deleteInst, setDeleteInst] = useState<InstanceWithStatus | null>(null); // 删除实例弹窗
   const [renameInst, setRenameInst] = useState<InstanceWithStatus | null>(null); // 重命名实例弹窗
   const [securityInst, setSecurityInst] = useState<InstanceWithStatus | null>(null); // 安全（内存阈值）弹窗
@@ -523,6 +524,9 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                       <button className="btn-text" onClick={() => setAssignUser(u)}>
                         可访问实例
                       </button>
+                      <button className="btn-text" onClick={() => setRenameUserTarget(u)}>
+                        改名
+                      </button>
                       <button className="btn-text" onClick={() => toggle(u)}>
                         {u.disabled ? '启用' : '禁用'}
                       </button>
@@ -672,6 +676,17 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           }}
         />
       )}
+      {renameUserTarget && (
+        <RenameUser
+          user={renameUserTarget}
+          onClose={() => setRenameUserTarget(null)}
+          onDone={() => {
+            setRenameUserTarget(null);
+            toast('用户名已修改', 'ok');
+            load();
+          }}
+        />
+      )}
       {deleteInst && (
         <DeleteInstance
           inst={deleteInst}
@@ -756,6 +771,43 @@ function RenameInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; o
             取消
           </button>
           <button className="btn btn-primary" disabled={busy || !name.trim() || name.trim() === inst.name}>
+            保存
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function RenameUser({ user, onClose, onDone }: { user: PanelUser; onClose: () => void; onDone: () => void }) {
+  const [name, setName] = useState(user.username);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      await api.renameUser(user.id, name.trim());
+      onDone();
+    } catch (e: any) {
+      setErr(e.message || '改名失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+        <h2>修改用户名</h2>
+        <input className="input" placeholder="新用户名（3-20 位字母/数字/下划线）" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        <div className="muted small" style={{ marginTop: 6 }}>改的是登录用户名；改后保持登录，下次用新用户名登录。</div>
+        {err && <div className="error">{err}</div>}
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn btn-primary" disabled={busy || !name.trim() || name.trim() === user.username}>
             保存
           </button>
         </div>

@@ -230,6 +230,18 @@ export function deleteUser(id: string) {
   persist();
 }
 
+// 改用户名（登录名）。格式校验在路由层；这里只查重并写入。会话以 userId 为准，改名后无需重新登录。
+export function renameUser(id: string, newUsername: string) {
+  const u = findById(id);
+  if (!u) throw new Error('用户不存在');
+  const name = String(newUsername || '').trim();
+  const existing = findByUsername(name);
+  if (existing && existing.id !== id) throw new Error('用户名已存在');
+  u.username = name;
+  persist();
+  return publicUser(u);
+}
+
 // 设置某账户可访问的实例（账户侧编辑）
 export function setUserInstances(id: string, instanceIds: string[]) {
   const u = findById(id);
