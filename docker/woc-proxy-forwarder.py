@@ -1,44 +1,28 @@
 #!/usr/bin/env python3
-"""本地 SOCKS5 → 上游 HTTP 代理转发器。
+"""本地 HTTP 代理 → 上游 HTTP 代理，注入认证。
 
-Chromium 设 ALL_PROXY=socks5://127.0.0.1:1080 走本地，
-本地完成 SOCKS5 握手后，向上游 HTTP 代理发 CONNECT 建隧道。
+Chromium 设 HTTP_PROXY=http://127.0.0.1:8080（无认证，不弹框），
+本地代理对每个请求注入 Proxy-Authorization 后转发上游。
 """
 
 import os
 import select
 import socket
-import struct
 import socketserver
 from base64 import b64decode
 
 HOST = os.environ["WOC_PROXY_HOST"]
 PORT = int(os.environ["WOC_PROXY_PORT"])
 AUTH_B64 = os.environ.get("WOC_PROXY_AUTH", "")
-LISTEN = int(os.environ.get("WOC_PROXY_LISTEN", "1080"))
+LISTEN = int(os.environ.get("WOC_PROXY_LISTEN", "8080"))
 
-# HTTP 上游认证头
-PROXY_AUTH = ""
+AUTH_HDR = ""
 if AUTH_B64:
     try:
-        raw = b64decode(AUTH_B64).decode()
-        PROXY_AUTH = f"Proxy-Authorization: Basic {AUTH_B64}\r\n"
+        b64decode(AUTH_B64)
+        AUTH_HDR = f"Proxy-Authorization: Basic {AUTH_B64}\r\n"
     except Exception:
         pass
-
-SOCKS_VER = 0x05
-SOCKS_ATYP_IPV4 = 0x01
-SOCKS_ATYP_DOMAIN = 0x03
-
-
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        c = sock.recv(n - len(buf))
-        if not c:
-            raise OSError("连接关闭")
-        buf += c
-    return buf
 
 
 def _relay(a: socket.socket, b: socket.socket) -> None:
@@ -64,81 +48,87 @@ def _relay(a: socket.socket, b: socket.socket) -> None:
                 return
 
 
+def _read_req(sock: socket.socket) -> bytes | None:
+    """读到 \r\n\r\n，有 Content-Length 续读 body。"""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        c = sock.recv(4096)
+        if not c:
+            return None
+        data += c
+    end = data.find(b"\r\n\r\n") + 4
+    for line in data[:end].split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            try:
+                cl = int(line.split(b":", 1)[1].strip())
+            except (ValueError, IndexError):
+                cl = 0
+            body = data[end:]
+            while len(body) < cl:
+                c = sock.recv(min(4096, cl - len(body)))
+                if not c:
+                    break
+                body += c
+            return data[:end] + body
+    return data
+
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         try:
-            self._do_socks5()
-        except OSError:
-            pass
-
-    def _do_socks5(self):
-        c = self.request
-
-        # 1. 方法协商（无认证）
-        ver, nm = struct.unpack("!BB", _recv_exact(c, 2))
-        if ver != SOCKS_VER:
-            c.sendall(b"\x05\xFF")
-            return
-        _recv_exact(c, nm)
-        c.sendall(b"\x05\x00")  # 无认证
-
-        # 2. CONNECT 请求
-        ver, cmd, _, atyp = struct.unpack("!BBBB", _recv_exact(c, 4))
-        if cmd != 1:  # 只支持 CONNECT
-            c.sendall(struct.pack("!BBBB", SOCKS_VER, 7, 0, SOCKS_ATYP_IPV4)
-                      + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
-            return
-
-        if atyp == SOCKS_ATYP_IPV4:
-            host = socket.inet_ntoa(_recv_exact(c, 4))
-        elif atyp == SOCKS_ATYP_DOMAIN:
-            host = _recv_exact(c, _recv_exact(c, 1)[0]).decode()
-        else:
-            host = socket.inet_ntop(socket.AF_INET6, _recv_exact(c, 16))
-        port = struct.unpack("!H", _recv_exact(c, 2))[0]
-
-        # 3. HTTP CONNECT 上游
-        up = socket.create_connection((HOST, PORT), 10)
-        req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{PROXY_AUTH}\r\n"
-        up.sendall(req.encode())
-
-        # 读上游响应
-        resp = b""
-        while b"\r\n\r\n" not in resp:
-            chunk = up.recv(4096)
-            if not chunk:
-                up.close()
-                c.sendall(struct.pack("!BBBB", SOCKS_VER, 1, 0, SOCKS_ATYP_IPV4)
-                          + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+            data = _read_req(self.request)
+            if not data:
                 return
-            resp += chunk
-
-        code = resp.split(b" ")[1] if len(resp.split(b" ")) > 1 else b""
-        if code != b"200":
-            up.close()
-            c.sendall(struct.pack("!BBBB", SOCKS_VER, 5, 0, SOCKS_ATYP_IPV4)
-                      + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+        except OSError:
             return
 
-        # 4. 告诉客户端隧道已建立
-        c.sendall(struct.pack("!BBBB", SOCKS_VER, 0, 0, SOCKS_ATYP_IPV4)
-                  + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+        # 注入认证头
+        if AUTH_HDR:
+            idx = data.find(b"\r\n")
+            if idx >= 0:
+                data = data[: idx + 2] + AUTH_HDR.encode() + data[idx + 2 :]
 
-        # 5. 双向中继
-        _relay(c, up)
+        is_connect = data.startswith(b"CONNECT ")
+
         try:
-            up.close()
+            up = socket.create_connection((HOST, PORT), 10)
+        except OSError:
+            try:
+                self.request.close()
+            except OSError:
+                pass
+            return
+
+        try:
+            up.sendall(data)
+            if is_connect:
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    c = up.recv(4096)
+                    if not c:
+                        return
+                    resp += c
+                self.request.sendall(resp)
+            _relay(self.request, up)
         except OSError:
             pass
+        finally:
+            try:
+                up.close()
+            except OSError:
+                pass
+            try:
+                self.request.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", LISTEN), Handler)
     srv.allow_reuse_address = True
     print(
-        f"[woc-proxy] SOCKS5 → HTTP 代理已启动 "
-        f"127.0.0.1:{LISTEN} → {HOST}:{PORT}"
-        + ("（认证）" if PROXY_AUTH else ""),
+        f"[woc-proxy] HTTP 代理已启动 127.0.0.1:{LISTEN} → {HOST}:{PORT}"
+        + ("（认证）" if AUTH_HDR else ""),
         flush=True,
     )
     srv.serve_forever()

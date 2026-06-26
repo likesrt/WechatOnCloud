@@ -28,15 +28,18 @@ if { [ "${WOC_DARK:-}" = "1" ] || [ "${WOC_DARK:-}" = "true" ]; } && [ "$APP_TYP
     echo “[autostart] 浏览器深色已启用（--force-dark-mode）”
 fi
 
-# 代理：启动本地 SOCKS5 转发器，Chromium 通过 ALL_PROXY 全局走代理。
-# 转发器在 127.0.0.1:1080 监听，向上游注入认证后转发。
+# 代理：启动本地 HTTP 转发器，向上游注入认证。
+# Chromium 通过 HTTP_PROXY/HTTPS_PROXY 走系统代理（这两个环境变量 Chromium 认）。
+# 本地代理无需认证 → 不弹框；由转发器向上游注入 Proxy-Authorization。
 if [ "$APP_TYPE" = "chromium" ] && [ -n "${WOC_PROXY_HOST:-}" ] && [ -n "${WOC_PROXY_PORT:-}" ]; then
-    PROXY_LISTEN=1080
+    PROXY_LISTEN=8080
     echo "[autostart] 启动代理转发器 127.0.0.1:${PROXY_LISTEN} → ${WOC_PROXY_HOST}:${WOC_PROXY_PORT}"
     /woc/woc-proxy-forwarder.py &
-    # 全局走 SOCKS5 代理
-    export ALL_PROXY="socks5://127.0.0.1:${PROXY_LISTEN}"
-    export all_proxy="socks5://127.0.0.1:${PROXY_LISTEN}"
+    # Chromium 认 HTTP_PROXY/HTTPS_PROXY（不认 ALL_PROXY）
+    export HTTP_PROXY="http://127.0.0.1:${PROXY_LISTEN}"
+    export http_proxy="http://127.0.0.1:${PROXY_LISTEN}"
+    export HTTPS_PROXY="http://127.0.0.1:${PROXY_LISTEN}"
+    export https_proxy="http://127.0.0.1:${PROXY_LISTEN}"
     # 排除内部通信
     export NO_PROXY="localhost,127.0.0.1,::1,*.local"
     export no_proxy="localhost,127.0.0.1,::1,*.local"
