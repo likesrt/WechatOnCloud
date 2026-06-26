@@ -28,12 +28,21 @@ if { [ "${WOC_DARK:-}" = "1" ] || [ "${WOC_DARK:-}" = "true" ]; } && [ "$APP_TYP
     echo “[autostart] 浏览器深色已启用（--force-dark-mode）”
 fi
 
-# 代理：Chromium 使用环境变量 HTTP_PROXY/HTTPS_PROXY（支持内嵌认证）。
-# Telegram 桌面版也吃系统 HTTP_PROXY 环境变量，无需额外处理。
-# 注意：--proxy-server 旗标不支持内嵌的 user:pass@，会导致浏览器反复弹认证框；
-# 而环境变量格式 http://user:pass@host:port 可被 Chromium 正确解析并自动认证。
-if [ "$APP_TYPE" = "chromium" ] && [ -n "${HTTP_PROXY:-}" ]; then
-    echo "[autostart] 代理已启用（通过环境变量 HTTP_PROXY，自动认证）"
+# 代理：Chromium 不认 HTTP_PROXY 里的 user:pass@，有认证必弹框。
+# 这里启动本地转发器，由它向上游注入认证；Chromium 连本地无需认证。
+if [ "$APP_TYPE" = "chromium" ] && [ -n "${WOC_PROXY_HOST:-}" ] && [ -n "${WOC_PROXY_PORT:-}" ]; then
+    # 转发器监听 18080 → 上游代理
+    PROXY_LISTEN=18080
+    echo "[autostart] 启动代理转发器 127.0.0.1:${PROXY_LISTEN} → ${WOC_PROXY_HOST}:${WOC_PROXY_PORT}"
+    /woc/woc-proxy-forwarder.py &
+    # 把 HTTP_PROXY 重定向到本地转发器（无认证），Chromium 不再弹框
+    export HTTP_PROXY="http://127.0.0.1:${PROXY_LISTEN}"
+    export http_proxy="http://127.0.0.1:${PROXY_LISTEN}"
+    export HTTPS_PROXY="http://127.0.0.1:${PROXY_LISTEN}"
+    export https_proxy="http://127.0.0.1:${PROXY_LISTEN}"
+    # 排除内部通信，防 KasmVNC 反代走代理导致连不上
+    export NO_PROXY="localhost,127.0.0.1,::1,*.local"
+    export no_proxy="localhost,127.0.0.1,::1,*.local"
 fi
 
 # 防”最小化后丢失”：本桌面（openbox）无任务栏，窗口被最小化就无处恢复 → 黑屏。

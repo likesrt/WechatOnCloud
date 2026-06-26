@@ -114,26 +114,23 @@ function videoDevices(): string[] {
   return [];
 }
 
-/** 将实例代理配置转为容器环境变量列表。无代理时返回空数组。 */
+/** 将实例代理配置转为容器环境变量列表。无代理时返回空数组。
+ *
+ * 不再把 user:pass 嵌入 HTTP_PROXY URL（Chromium 不认，会弹认证框），
+ * 而是通过 WOC_PROXY_* 变量把原始信息透给 autostart，由 woc-proxy-forwarder.py
+ * 在容器内起本地转发器向上游注入认证，Chromium 连本地无需认证。 */
 function proxyEnv(inst: Instance): string[] {
   const p = inst.proxy;
   if (!p) return [];
   const proto = p.type === 'socks5' ? 'socks5' : 'http';
-  // 有认证时嵌入 URL
   const auth = p.username
-    ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password || '')}@`
+    ? Buffer.from(`${p.username}:${p.password || ''}`).toString('base64')
     : '';
-  const addr = `${proto}://${auth}${p.host}:${p.port}`;
   return [
-    `HTTP_PROXY=${addr}`,
-    `http_proxy=${addr}`,
-    `HTTPS_PROXY=${addr}`,
-    `https_proxy=${addr}`,
-    `ALL_PROXY=${addr}`,
-    `all_proxy=${addr}`,
-    // 排除内部通信：面板↔实例、localhost。防止 KasmVNC 反代走代理导致连不上。
-    `NO_PROXY=localhost,127.0.0.1,::1,*.local`,
-    `no_proxy=localhost,127.0.0.1,::1,*.local`,
+    `WOC_PROXY_HOST=${p.host}`,
+    `WOC_PROXY_PORT=${String(p.port)}`,
+    `WOC_PROXY_PROTO=${proto}`,
+    ...(auth ? [`WOC_PROXY_AUTH=${auth}`] : []),
   ];
 }
 

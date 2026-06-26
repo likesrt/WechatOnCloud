@@ -75,6 +75,10 @@ RUN chmod 755 /woc/wechat-ctl.sh
 COPY app-defs.sh app-ctl.sh /woc/
 RUN chmod 644 /woc/app-defs.sh && chmod 755 /woc/app-ctl.sh
 
+# 本地代理转发器：向上游注入认证头，消除 Chromium 反复弹认证框
+COPY woc-proxy-forwarder.py /woc/woc-proxy-forwarder.py
+RUN chmod 755 /woc/woc-proxy-forwarder.py
+
 # openbox 会话启动时执行此脚本：等待微信就绪 + 常驻拉起微信 + 最小化自动复原看守
 COPY autostart /defaults/autostart
 RUN chmod 755 /defaults/autostart
