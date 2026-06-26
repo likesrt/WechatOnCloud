@@ -43,26 +43,50 @@ AUTH_HEADER = (
 )
 
 
-def recv_all(sock: socket.socket, size: int) -> bytes:
-    """循环 recv 直到读够 size 字节或对端关闭。socket.recv 不保证一次读满。"""
-    chunks: list[bytes] = []
-    remain = size
-    while remain > 0:
+def recv_headers(sock: socket.socket) -> bytes:
+    """读取直到 \r\n\r\n 标记 HTTP 头结束，有 Content-Length 再读 body。"""
+    data = b""
+    while b"\r\n\r\n" not in data:
         try:
-            chunk = sock.recv(remain)
+            chunk = sock.recv(4096)
         except OSError:
             break
         if not chunk:
             break
-        chunks.append(chunk)
-        remain -= len(chunk)
-    return b"".join(chunks)
+        data += chunk
+    if b"\r\n\r\n" not in data:
+        return data  # 不完整的请求，原样转发
+
+    headers_end = data.index(b"\r\n\r\n") + 4
+    headers = data[:headers_end]
+
+    # 检查 Content-Length 决定是否读 body
+    cl = 0
+    for line in headers.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            try:
+                cl = int(line.split(b":", 1)[1].strip())
+            except (ValueError, IndexError):
+                pass
+            break
+
+    body = data[headers_end:]
+    while len(body) < cl:
+        try:
+            chunk = sock.recv(min(4096, cl - len(body)))
+        except OSError:
+            break
+        if not chunk:
+            break
+        body += chunk
+
+    return headers + body
 
 
 def relay(client: socket.socket) -> None:
     """读取客户端首请求，注入认证头后发往上游，然后双向中继。"""
     try:
-        data = recv_all(client, 65536)
+        data = recv_headers(client)
     except OSError:
         client.close()
         return
